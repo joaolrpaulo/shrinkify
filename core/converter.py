@@ -1,7 +1,7 @@
 """
 converter.py — Conversion logic.
 
-Images  -> ffmpeg (AVIF) + exiftool for metadata preservation
+Images  -> ffmpeg (AVIF, optionally GPU-accelerated) + exiftool for metadata preservation
 Videos  -> ffmpeg with auto-detected hardware encoder
 
 Image conversion requires exiftool. If exiftool is not found at startup,
@@ -26,6 +26,27 @@ from core.analyzer import QUALITY_PRESETS, DEFAULT_PRESET
 # Stores the stderr output of the first failing probe for each encoder,
 # so the GUI can surface a useful "why did GPU detection fail?" message.
 _PROBE_FAILURE_REASONS: dict[str, str] = {}
+
+
+def _run_encoder_probe(encoder: str, cmd: list[str]) -> bool:
+    """Runs a probe command and records a concise failure reason."""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True, encoding='utf-8', errors='replace', timeout=15,
+            **no_window()
+        )
+        if result.returncode == 0:
+            _PROBE_FAILURE_REASONS.pop(encoder, None)
+            return True
+        _PROBE_FAILURE_REASONS[encoder] = (result.stderr or '(no stderr)').strip()[-400:]
+        return False
+    except subprocess.TimeoutExpired:
+        _PROBE_FAILURE_REASONS[encoder] = 'probe timed out after 15 s'
+        return False
+    except Exception as exc:
+        _PROBE_FAILURE_REASONS[encoder] = str(exc)
+        return False
 
 
 def _probe_encoder(encoder: str) -> bool:
@@ -53,25 +74,28 @@ def _probe_encoder(encoder: str) -> bool:
         base_cmd += ['-color_range', 'tv']
     base_cmd += ['-c:v', encoder, '-f', 'null', '-']
 
-    try:
-        result = subprocess.run(
-            base_cmd,
-            capture_output=True, encoding='utf-8', errors='replace', timeout=15,
-            **no_window()
-        )
-        if result.returncode == 0:
-            _PROBE_FAILURE_REASONS.pop(encoder, None)   # clear any stale entry
-            return True
-        # Store the last 400 chars of stderr so the GUI can report it
-        reason = (result.stderr or '(no stderr)').strip()[-400:]
-        _PROBE_FAILURE_REASONS[encoder] = reason
-        return False
-    except subprocess.TimeoutExpired:
-        _PROBE_FAILURE_REASONS[encoder] = 'probe timed out after 15 s'
-        return False
-    except Exception as exc:
-        _PROBE_FAILURE_REASONS[encoder] = str(exc)
-        return False
+    return _run_encoder_probe(encoder, base_cmd)
+
+
+def _probe_hwframe_encoder(
+    encoder: str,
+    device_spec: str,
+    device_name: str,
+    pixel_format: str,
+    encoder_options: list[str],
+) -> bool:
+    """Tests an encoder that accepts only frames uploaded to a hardware device."""
+    cmd = [
+        FFMPEG, '-loglevel', 'error',
+        '-init_hw_device', device_spec,
+        '-filter_hw_device', device_name,
+        '-f', 'lavfi', '-i', 'color=black:s=256x256:r=1:d=1',
+        '-vf', f'format={pixel_format},hwupload',
+        '-vframes', '1',
+        '-c:v', encoder, *encoder_options,
+        '-f', 'null', '-',
+    ]
+    return _run_encoder_probe(encoder, cmd)
 
 
 def detect_hw_encoder() -> str | None:
@@ -122,6 +146,53 @@ def get_hw_probe_failure_reason() -> str:
     for enc, reason in _PROBE_FAILURE_REASONS.items():
         lines.append(f'{enc}: {reason}')
     return '\n'.join(lines)
+
+
+def detect_hw_image_encoder() -> str | None:
+    """Returns a working hardware AV1 encoder suitable for AVIF output."""
+    try:
+        result = subprocess.run(
+            [FFMPEG, '-encoders'],
+            capture_output=True, encoding='utf-8', errors='replace', timeout=10,
+            **no_window()
+        )
+        output = result.stdout + result.stderr
+    except Exception:
+        return None
+
+    # AVIF stores AV1.  Keep this separate from HEVC video detection: a GPU
+    # may encode HEVC but not AV1 (for example, pre-Ada NVIDIA hardware).
+    candidates = [
+        ('av1_videotoolbox', sys.platform == 'darwin'),
+        ('av1_nvenc',        True),
+        ('av1_qsv',          True),
+        ('av1_amf',          True),
+        ('av1_vaapi',        sys.platform.startswith('linux')),
+        ('av1_vulkan',       sys.platform.startswith('linux') or sys.platform == 'win32'),
+    ]
+    hardware_frame_probes = {
+        'av1_vaapi': ('vaapi=va', 'va', 'nv12', ['-rc_mode', 'CQP', '-qp', '32']),
+        'av1_vulkan': ('vulkan=vk', 'vk', 'yuv420p', ['-rc_mode', 'cqp', '-qp', '32']),
+    }
+    for encoder, ok in candidates:
+        if not ok or encoder not in output:
+            continue
+        probe_config = hardware_frame_probes.get(encoder)
+        if probe_config and _probe_hwframe_encoder(encoder, *probe_config):
+            return encoder
+        if not probe_config and _probe_encoder(encoder):
+            return encoder
+    return None
+
+
+_HW_IMAGE_ENCODER_CACHE: str | None | bool = False  # False = not yet probed
+
+
+def get_hw_image_encoder() -> str | None:
+    global _HW_IMAGE_ENCODER_CACHE
+    if _HW_IMAGE_ENCODER_CACHE is False:
+        _HW_IMAGE_ENCODER_CACHE = detect_hw_image_encoder()
+    return _HW_IMAGE_ENCODER_CACHE
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +314,51 @@ def _copy_metadata_exiftool(source: Path, dest: Path) -> bool:
         return False
 
 
-def _convert_image_ffmpeg(mf: MediaFile, output_path: Path, quality: int) -> ConversionResult:
+def _image_cmd(
+    mf: MediaFile,
+    output_path: Path,
+    quality: int,
+    use_hw_accel: bool,
+) -> tuple[list[str], bool]:
+    """Builds an AVIF command and says whether it uses a hardware encoder."""
+    crf = _image_crf(quality)
+    cmd = [FFMPEG, '-loglevel', 'error', '-i', str(mf.path)]
+    hw_encoder = get_hw_image_encoder() if use_hw_accel else None
+    if hw_encoder == 'av1_videotoolbox':
+        cmd += ['-c:v', hw_encoder, '-q:v', str(crf)]
+    elif hw_encoder == 'av1_nvenc':
+        cmd += ['-c:v', hw_encoder, '-rc', 'vbr', '-cq', str(crf),
+                '-b:v', '0', '-preset', 'p4']
+    elif hw_encoder == 'av1_qsv':
+        cmd += ['-c:v', hw_encoder, '-global_quality', str(crf)]
+    elif hw_encoder == 'av1_amf':
+        cmd += ['-c:v', hw_encoder, '-quality', 'quality', '-rc', 'cqp',
+                '-qp_i', str(crf), '-qp_p', str(crf)]
+    elif hw_encoder == 'av1_vaapi':
+        # VA-API accepts only hardware frames, so initialise a VA device and
+        # upload the decoded image before handing it to the encoder.
+        cmd[3:3] = ['-init_hw_device', 'vaapi=va', '-filter_hw_device', 'va']
+        cmd += ['-vf', 'format=nv12,hwupload', '-c:v', hw_encoder,
+                '-rc_mode', 'CQP', '-qp', str(crf)]
+    elif hw_encoder == 'av1_vulkan':
+        # Like VA-API, Vulkan encoders accept hardware frames only.
+        cmd[3:3] = ['-init_hw_device', 'vulkan=vk', '-filter_hw_device', 'vk']
+        cmd += ['-vf', 'format=yuv420p,hwupload', '-c:v', hw_encoder,
+                '-rc_mode', 'cqp', '-qp', str(crf), '-tune', 'hq']
+    else:
+        # Explicitly select the existing CPU encoder so a failed GPU attempt
+        # can reliably retry with the same output format and quality.
+        cmd += ['-c:v', 'libaom-av1', '-crf', str(crf), '-still-picture', '1']
+    cmd += ['-y', str(output_path)]
+    return cmd, hw_encoder is not None
+
+
+def _convert_image_ffmpeg(
+    mf: MediaFile,
+    output_path: Path,
+    quality: int,
+    use_hw_accel: bool = False,
+) -> ConversionResult:
     """
     Two-step image conversion pipeline:
       1. ffmpeg  — compresses to AVIF
@@ -263,21 +378,24 @@ def _convert_image_ffmpeg(mf: MediaFile, output_path: Path, quality: int) -> Con
             ),
         )
 
-    crf = _image_crf(quality)
-    cmd = [
-        FFMPEG, '-loglevel', 'error',
-        '-i', str(mf.path),
-        '-crf', str(crf),
-        '-y',
-        str(output_path),
-    ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
+        cmd, used_hw_encoder = _image_cmd(mf, output_path, quality, use_hw_accel)
         result = subprocess.run(
             cmd, capture_output=True, timeout=300,
             encoding='utf-8', errors='replace', **no_window()
         )
+        if (result.returncode != 0 or not output_path.exists()) and used_hw_encoder:
+            # A probe can pass while a particular image fails due to its pixel
+            # format or driver limits.  Preserve conversion reliability by
+            # retrying the established CPU path once.
+            output_path.unlink(missing_ok=True)
+            cmd, _ = _image_cmd(mf, output_path, quality, use_hw_accel=False)
+            result = subprocess.run(
+                cmd, capture_output=True, timeout=300,
+                encoding='utf-8', errors='replace', **no_window()
+            )
         if result.returncode != 0 or not output_path.exists():
             err = (result.stderr or '')[-600:]
             return ConversionResult(
@@ -356,7 +474,7 @@ def convert_file(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if mf.media_type == 'image':
-        return _convert_image_ffmpeg(mf, output_path, _image_quality(preset))
+        return _convert_image_ffmpeg(mf, output_path, _image_quality(preset), use_hw_accel)
 
     # --- Video ---
     cmd = _video_cmd(mf, output_path, use_hw_accel, preset)
